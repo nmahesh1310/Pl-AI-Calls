@@ -1,302 +1,286 @@
-import os
-import json
-import asyncio
-import logging
-import sys
-import base64
-import requests
-import io
-import struct
+import os, json, asyncio, logging, sys, base64, requests, io, struct, time
 from dotenv import load_dotenv
-
-
-
-
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
 
-
-
-
-# --------------------------------------------------
-# ENV
-# --------------------------------------------------
+# ================= ENV =================
 load_dotenv()
-
-
-
-
 PORT = int(os.getenv("PORT", 10000))
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 
-
-
-
+# ================= AUDIO =================
 SAMPLE_RATE = 16000
-BYTES_PER_SAMPLE = 2
 MIN_CHUNK_SIZE = 3200
-SPEECH_THRESHOLD = 500
-SILENCE_CHUNKS = 6  # ~600ms silence ends utterance
+SPEECH_THRESHOLD = 520
 
+SILENCE_CHUNKS = 10
+MIN_SPEECH_CHUNKS = 6
 
+POST_TTS_DELAY = 0.6
+FAIL_COOLDOWN_SEC = 8
 
+MAX_CONFUSION = 3
+MAX_SILENCE_PROMPTS = 2
 
-# --------------------------------------------------
-# LOGGING
-# --------------------------------------------------
+# ================= LOGGING =================
 logging.basicConfig(
-  level=logging.DEBUG,
-  format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-  handlers=[logging.StreamHandler(sys.stdout)],
-  force=True
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True
 )
+log = logging.getLogger("voicebot")
 
-
-
-
-logger = logging.getLogger("voicebot")
-tts_logger = logging.getLogger("sarvam-tts")
-stt_logger = logging.getLogger("sarvam-stt")
-
-
-
-
-# --------------------------------------------------
-# FASTAPI
-# --------------------------------------------------
+# ================= APP =================
 app = FastAPI()
 
+# ================= SCRIPT =================
+PITCH_1 = (
+    "Hi, my name is Neeraja, calling from Rupeek. "
+    "You have a pre approved personal loan at zero interest."
+)
 
+PITCH_2 = (
+    "The process is completely digital with no paperwork. "
+    "You can receive instant disbursal in sixty seconds. "
+    "With timely repayments you can improve your CIBIL score. "
+    "This is a limited time offer. Are you interested?"
+)
 
-
-# --------------------------------------------------
-# FAQ
-# --------------------------------------------------
-FAQS = [
-  (["interest", "rate"],
-   "The interest rate starts from ten percent per annum and is personalized for each customer."),
-  (["limit", "pre approved"],
-   "Your loan limit is already sanctioned. Please check the Rupeek app."),
-  (["emi", "repay"],
-   "Your EMI will be auto deducted on the fifth of every month.")
+STEPS = [
+    "Step one. Download the Rupeek app from the Play Store. Say next once done.",
+    "Step two. Complete your KYC using Aadhaar. Say next once completed.",
+    "Step three. Select your loan amount and confirm disbursal. Say done to finish."
 ]
 
+FAQS = [
+    (["emi", "monthly"], "The EMI depends on the tenure you select. The app shows the exact EMI amount."),
+    (["interest", "roi"], "If repayment is missed, the loan converts into EMI with interest as shown in the app."),
+    (["limit", "amount"], "Your approved loan amount is visible inside the Rupeek app."),
+    (["processing", "fee"], "The processing fee is a one time charge for instant digital disbursal.")
+]
 
+NEUTRAL_WORDS = ["okay", "ok", "right", "nice", "thanks", "thank you", "fine"]
+PARTIAL_QUESTIONS = ["what is", "what", "rate", "interest", "emi", "amount"]
 
+# ================= INTENT =================
+def classify(text):
+    t = text.lower().strip()
 
-def get_reply(text: str) -> str:
-  text = text.lower()
-  for keys, reply in FAQS:
-      if any(k in text for k in keys):
-          return reply
-  return "I can help you with interest rate, loan limit, or repayment."
+    if not t:
+        return "EMPTY", None
 
+    if any(x in t for x in NEUTRAL_WORDS):
+        return "NEUTRAL", None
 
+    if any(t.startswith(p) for p in PARTIAL_QUESTIONS):
+        return "PARTIAL", None
 
+    if any(x in t for x in ["hello", "hi", "hey"]):
+        return "GREETING", None
 
-# --------------------------------------------------
-# UTILS
-# --------------------------------------------------
-def is_speech(pcm: bytes) -> bool:
-  total, count = 0, 0
-  for i in range(0, len(pcm) - 1, 2):
-      s = int.from_bytes(pcm[i:i+2], "little", signed=True)
-      total += abs(s)
-      count += 1
-  if count == 0:
-      return False
-  avg = total / count
-  logger.debug(f"🔈 Avg amplitude={avg}")
-  return avg > SPEECH_THRESHOLD
+    if any(x in t for x in ["yes", "interested", "sure"]):
+        return "YES", None
 
+    if any(x in t for x in ["no", "not interested"]):
+        return "NO", None
 
+    if any(x in t for x in ["next"]):
+        return "NEXT", None
 
+    if any(x in t for x in ["previous", "back"]):
+        return "PREVIOUS", None
 
-def pcm_to_wav(pcm: bytes) -> bytes:
-  buf = io.BytesIO()
-  buf.write(b"RIFF")
-  buf.write(struct.pack("<I", 36 + len(pcm)))
-  buf.write(b"WAVEfmt ")
-  buf.write(struct.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE,
-                         SAMPLE_RATE * 2, 2, 16))
-  buf.write(b"data")
-  buf.write(struct.pack("<I", len(pcm)))
-  buf.write(pcm)
-  return buf.getvalue()
+    if any(x in t for x in ["repeat"]):
+        return "REPEAT", None
 
+    if any(x in t for x in ["done", "complete"]):
+        return "DONE", None
 
+    if any(x in t for x in ["agent", "human", "representative"]):
+        return "HUMAN", None
 
+    for keys, _ in FAQS:
+        if any(k in t for k in keys):
+            return "FAQ", keys
 
-# --------------------------------------------------
-# SARVAM
-# --------------------------------------------------
-def sarvam_stt(pcm: bytes) -> str:
-  wav = pcm_to_wav(pcm)
-  resp = requests.post(
-      "https://api.sarvam.ai/speech-to-text",
-      headers={"api-subscription-key": SARVAM_API_KEY},
-      files={"file": ("audio.wav", wav, "audio/wav")},
-      data={"language_code": "en-IN"},
-      timeout=20
-  )
-  stt_logger.info(f"📡 STT status={resp.status_code}")
-  stt_logger.debug(f"📦 STT raw={resp.text}")
-  resp.raise_for_status()
+    return "UNKNOWN", None
 
+# ================= AUDIO =================
+def is_speech(pcm):
+    energy = sum(abs(int.from_bytes(pcm[i:i+2], "little", signed=True))
+                 for i in range(0, len(pcm)-1, 2))
+    return (energy / max(len(pcm)//2, 1)) > SPEECH_THRESHOLD
 
+def pcm_to_wav(pcm):
+    buf = io.BytesIO()
+    buf.write(b"RIFF")
+    buf.write(struct.pack("<I", 36 + len(pcm)))
+    buf.write(b"WAVEfmt ")
+    buf.write(struct.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE,
+                           SAMPLE_RATE*2, 2, 16))
+    buf.write(b"data")
+    buf.write(struct.pack("<I", len(pcm)))
+    buf.write(pcm)
+    return buf.getvalue()
 
+def stt_safe(pcm):
+    try:
+        r = requests.post(
+            "https://api.sarvam.ai/speech-to-text",
+            headers={"api-subscription-key": SARVAM_API_KEY},
+            files={"file": ("audio.wav", pcm_to_wav(pcm), "audio/wav")},
+            data={"language_code": "en-IN"},
+            timeout=10
+        )
+        return r.json().get("transcript", "").strip() if r.status_code == 200 else ""
+    except:
+        return ""
 
-  # ✅ FIXED: transcript field
-  return resp.json().get("transcript", "").strip()
+def tts(text):
+    r = requests.post(
+        "https://api.sarvam.ai/text-to-speech",
+        headers={"api-subscription-key": SARVAM_API_KEY, "Content-Type": "application/json"},
+        json={"text": text, "target_language_code": "en-IN", "speech_sample_rate": "16000"},
+        timeout=10
+    )
+    r.raise_for_status()
+    return base64.b64decode(r.json()["audios"][0])
 
+async def speak(ws, text, session):
+    log.info(f"🗣 BOT → {text[:80]}...")
+    session["bot_speaking"] = True
+    pcm = await asyncio.to_thread(tts, text)
+    for i in range(0, len(pcm), MIN_CHUNK_SIZE):
+        await ws.send_text(json.dumps({"event": "media", "media": {"payload": base64.b64encode(pcm[i:i+MIN_CHUNK_SIZE]).decode()}}))
+    await asyncio.sleep(POST_TTS_DELAY)
+    session["bot_speaking"] = False
 
-
-
-def sarvam_tts(text: str) -> bytes:
-  resp = requests.post(
-      "https://api.sarvam.ai/text-to-speech",
-      headers={
-          "api-subscription-key": SARVAM_API_KEY,
-          "Content-Type": "application/json"
-      },
-      json={
-          "text": text,
-          "target_language_code": "en-IN",
-          "speech_sample_rate": "16000"
-      },
-      timeout=15
-  )
-  resp.raise_for_status()
-  return base64.b64decode(resp.json()["audios"][0])
-
-
-
-
-async def send_pcm(ws: WebSocket, pcm: bytes):
-  for i in range(0, len(pcm), MIN_CHUNK_SIZE):
-      await ws.send_text(json.dumps({
-          "event": "media",
-          "media": {
-              "payload": base64.b64encode(
-                  pcm[i:i + MIN_CHUNK_SIZE]
-              ).decode()
-          }
-      }))
-      await asyncio.sleep(0)
-
-
-
-
-# --------------------------------------------------
-# WS
-# --------------------------------------------------
+# ================= WS =================
 @app.websocket("/ws")
 async def ws_handler(ws: WebSocket):
-  await ws.accept()
-  logger.info("🎧 Exotel connected")
+    await ws.accept()
+    log.info("🎧 Call connected")
 
+    session = {
+        "phase": "PITCH",
+        "step": 0,
+        "failures": 0,
+        "silence_prompts": 0,
+        "handoff_asked": False,
+        "bot_speaking": False,
+        "started": False,
+        "last_fail_ts": 0
+    }
 
+    buf, speech = b"", b""
+    silence_chunks, speech_chunks = 0, 0
 
+    try:
+        while True:
+            msg = await ws.receive()
+            if "text" not in msg:
+                continue
 
-  buffer = b""
-  speech_buffer = b""
-  silence_count = 0
-  pitch_done = False
+            data = json.loads(msg["text"])
 
+            if data.get("event") == "start" and not session["started"]:
+                await speak(ws, PITCH_1, session)
+                await speak(ws, PITCH_2, session)
+                session["started"] = True
+                continue
 
+            if data.get("event") != "media" or session["bot_speaking"]:
+                continue
 
+            chunk = base64.b64decode(data["media"]["payload"])
+            buf += chunk
 
-  try:
-      while True:
-          msg = await ws.receive()
-          if "text" not in msg:
-              continue
+            if len(buf) < MIN_CHUNK_SIZE:
+                continue
 
+            frame, buf = buf[:MIN_CHUNK_SIZE], buf[MIN_CHUNK_SIZE:]
 
+            if is_speech(frame):
+                speech += frame
+                speech_chunks += 1
+                silence_chunks = 0
+            else:
+                silence_chunks += 1
 
+            if speech_chunks < MIN_SPEECH_CHUNKS and silence_chunks < SILENCE_CHUNKS:
+                continue
 
-          data = json.loads(msg["text"])
-          event = data.get("event")
+            text = await asyncio.to_thread(stt_safe, speech)
+            speech, speech_chunks, silence_chunks = b"", 0, 0
 
+            if not text:
+                continue
 
+            intent, meta = classify(text)
+            log.info(f"🗣 USER → {text} | intent={intent}")
 
+            # reset failures on healthy interaction
+            if intent in ["FAQ", "NEXT", "PREVIOUS", "REPEAT", "GREETING", "NEUTRAL"]:
+                session["failures"] = 0
+                session["handoff_asked"] = False
 
-          if event == "start" and not pitch_done:
-              pcm = await asyncio.to_thread(
-                  sarvam_tts,
-                  "Hello, this is Rupeek personal loan assistant. "
-                  "You may ask about interest rate, repayment, or loan limit."
-              )
-              await send_pcm(ws, pcm)
-              pitch_done = True
-              continue
+            if intent == "PARTIAL":
+                continue  # wait for completion
 
+            if intent == "FAQ":
+                for keys, ans in FAQS:
+                    if keys == meta:
+                        await speak(ws, ans, session)
+                        await speak(ws, "You can say next, repeat, or previous.", session)
+                        break
+                continue
 
+            if session["phase"] == "PITCH":
+                if intent == "YES":
+                    session["phase"] = "STEPS"
+                    await speak(ws, STEPS[0], session)
+                    continue
+                if intent == "NO":
+                    await speak(ws, "Thank you for your time. Have a great day.", session)
+                    break
 
+            if intent == "NEXT":
+                session["step"] += 1
+                if session["step"] >= len(STEPS):
+                    await speak(ws, "Your process is complete. Thank you.", session)
+                    break
+                await speak(ws, STEPS[session["step"]], session)
+                continue
 
-          if event != "media":
-              continue
+            if intent == "PREVIOUS":
+                session["step"] = max(0, session["step"] - 1)
+                await speak(ws, STEPS[session["step"]], session)
+                continue
 
+            if intent == "REPEAT":
+                await speak(ws, STEPS[session["step"]], session)
+                continue
 
+            if intent == "HUMAN":
+                await speak(ws, "Connecting you to a representative now.", session)
+                break
 
+            # UNKNOWN
+            now = time.time()
+            if now - session["last_fail_ts"] > FAIL_COOLDOWN_SEC:
+                session["failures"] += 1
+                session["last_fail_ts"] = now
 
-          payload = data["media"].get("payload")
-          if not payload:
-              continue
+                if session["failures"] >= MAX_CONFUSION and not session["handoff_asked"]:
+                    session["handoff_asked"] = True
+                    await speak(ws, "Would you like me to connect you to a representative?", session)
+                else:
+                    await speak(ws, "You can say next, repeat, previous, or no.", session)
 
+    except WebSocketDisconnect:
+        log.info("🔌 Call disconnected")
 
-
-
-          chunk = base64.b64decode(payload)
-          buffer += chunk
-
-
-
-
-          if len(buffer) < MIN_CHUNK_SIZE:
-              continue
-
-
-
-
-          frame = buffer[:MIN_CHUNK_SIZE]
-          buffer = buffer[MIN_CHUNK_SIZE:]
-
-
-
-
-          if is_speech(frame):
-              speech_buffer += frame
-              silence_count = 0
-          else:
-              silence_count += 1
-
-
-
-
-          # ---- END OF UTTERANCE ----
-          if silence_count >= SILENCE_CHUNKS and speech_buffer:
-              logger.info("🗣 Utterance ended — sending to STT")
-              text = await asyncio.to_thread(sarvam_stt, speech_buffer)
-              speech_buffer = b""
-              silence_count = 0
-
-
-
-
-              if not text:
-                  continue
-
-
-
-
-              logger.info(f"📝 User said: {text}")
-              reply = get_reply(text)
-              pcm = await asyncio.to_thread(sarvam_tts, reply)
-              await send_pcm(ws, pcm)
-
-
-
-
-  except WebSocketDisconnect:
-      logger.info("🔌 Call disconnected")
+# ================= START =================
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
