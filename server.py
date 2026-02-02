@@ -115,6 +115,7 @@ async def speak(ws, text, session):
     session["bot_speaking"] = False
 
 # ================= WS =================
+@app.websocket("/")
 @app.websocket("/ws")
 async def ws(ws: WebSocket):
     await ws.accept()
