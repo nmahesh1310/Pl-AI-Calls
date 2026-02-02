@@ -127,7 +127,12 @@ async def ws(ws: WebSocket):
 
     try:
         while True:
-            msg = await ws.receive()
+            try:
+    msg = await ws.receive()
+except RuntimeError:
+    log.info("🔌 Exotel rotated websocket after TTS — waiting for new media")
+    break
+
             if "text" not in msg:
                 continue
 
