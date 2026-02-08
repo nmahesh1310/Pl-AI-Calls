@@ -1,5 +1,5 @@
 # server.py
-import os, json, asyncio, logging, sys, base64, requests, io, struct, time
+import os, json, asyncio, logging, sys, base64, requests, io, struct
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
@@ -28,11 +28,11 @@ PITCH = (
     "Hi, my name is Neeraja from Rupeek. "
     "You have a pre-approved personal loan at zero interest. "
     "The process is fully digital and money is credited in sixty seconds. "
-    "Are you interested to know how to get this loan, or do you have any questions?"
+    "Would you like me to guide you through the process, or answer your questions?"
 )
 
 STEPS = [
-    "First, download the Rupeek app from Play Store.",
+    "First, download the Rupeek app from the Play Store.",
     "Next, complete your Aadhaar KYC.",
     "Then select your loan amount and confirm disbursal."
 ]
@@ -40,16 +40,16 @@ STEPS = [
 # ================= FAQ MASTER =================
 FAQ_MAP = {
     "interest": "It is zero percent interest if you repay by the due date. Otherwise EMI interest applies as shown in the app.",
-    "limit": "Your approved loan limit is visible inside the Rupeek app under Click Cash banner.",
-    "emi": "EMI depends on the tenure you select. The app shows exact EMI before confirmation.",
-    "processing fee": "Processing fee is shown clearly in the app before confirmation. No hidden charges.",
-    "documents": "No documents or income proof required. It is fully digital.",
+    "limit": "Your approved loan limit is visible inside the Rupeek app under the Click Cash banner.",
+    "emi": "EMI depends on the tenure you select. The app shows the exact EMI before confirmation.",
+    "processing fee": "Processing fee is shown clearly in the app before confirmation. There are no hidden charges.",
+    "documents": "No documents or income proof are required. It is fully digital.",
     "cibil": "Yes, timely repayment improves your CIBIL score.",
-    "not see banner": "Please update the Rupeek app and reopen it. You will see the Click Cash banner.",
-    "mandate": "The small amount paid during mandate is for bank verification and gets refunded.",
+    "banner": "Please update the Rupeek app and reopen it. You will see the Click Cash banner.",
+    "mandate": "The small amount paid during mandate setup is for bank verification and gets refunded.",
     "repayment": "You must repay by month-end to enjoy zero percent interest.",
-    "risk": "There is no risk if you repay on time. Otherwise it converts to EMI as shown in the app.",
-    "did not get money": "Once you complete the steps in the app, money is credited within sixty seconds.",
+    "risk": "There is no risk if you repay on time. Otherwise the loan converts into EMI.",
+    "did not get money": "Once you complete the steps in the app, money is credited within sixty seconds."
 }
 
 # ================= HELPERS =================
@@ -76,8 +76,10 @@ def pcm_to_wav(pcm):
     return buf.getvalue()
 
 def is_speech(pcm):
-    energy = sum(abs(int.from_bytes(pcm[i:i+2], "little", signed=True))
-                 for i in range(0, len(pcm)-1, 2))
+    energy = sum(
+        abs(int.from_bytes(pcm[i:i+2], "little", signed=True))
+        for i in range(0, len(pcm)-1, 2)
+    )
     return (energy / max(len(pcm)//2, 1)) > SPEECH_THRESHOLD
 
 def stt_safe(pcm):
@@ -117,9 +119,9 @@ async def speak(ws, text, session):
 # ================= WS =================
 @app.websocket("/")
 @app.websocket("/ws")
-async def ws(ws: WebSocket):
+async def ws_handler(ws: WebSocket):
     await ws.accept()
-    log.info("Call connected")
+    log.info("📞 Call connected")
 
     session = {"started": False, "bot_speaking": False, "step": 0}
     buf, speech = b"", b""
@@ -128,10 +130,10 @@ async def ws(ws: WebSocket):
     try:
         while True:
             try:
-    msg = await ws.receive()
-except RuntimeError:
-    log.info("🔌 Exotel rotated websocket after TTS — waiting for new media")
-    break
+                msg = await ws.receive()
+            except RuntimeError:
+                log.info("🔌 Exotel rotated websocket — closing handler cleanly")
+                break
 
             if "text" not in msg:
                 continue
@@ -171,30 +173,35 @@ except RuntimeError:
 
             log.info(f"USER → {text}")
 
-            # FAQ
             faq = detect_faq(text)
             if faq:
                 await speak(ws, faq, session)
                 continue
 
-            # Guide flow
             if "yes" in text.lower() or "guide" in text.lower():
                 if session["step"] < len(STEPS):
                     await speak(ws, STEPS[session["step"]], session)
                     session["step"] += 1
                 else:
-                    await speak(ws, "Great! Whenever you’re ready, just open the Rupeek app and check your pre-approved loan limit.", session)
+                    await speak(
+                        ws,
+                        "Great! Whenever you’re ready, just open the Rupeek app and check your pre-approved loan limit.",
+                        session
+                    )
                 continue
 
             if "no" in text.lower():
                 await speak(ws, "No problem. Thank you for your time.", session)
                 break
 
-            # default
-            await speak(ws, "I can guide you step by step or answer your questions about the loan.", session)
+            await speak(
+                ws,
+                "I can guide you step by step or answer any questions about the loan.",
+                session
+            )
 
     except WebSocketDisconnect:
-        log.info("Call disconnected")
+        log.info("📴 Call disconnected")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
