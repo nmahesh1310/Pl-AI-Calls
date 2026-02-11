@@ -30,6 +30,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
 )
 log = logging.getLogger("voicebot")
 
@@ -41,21 +42,21 @@ PITCH = (
     "Hi, my name is Neeraja from Rupeek. "
     "You have a pre-approved personal loan at zero interest. "
     "The process is fully digital and money is credited in sixty seconds. "
-    "Would you like me to guide you through the process, or answer your questions?"
+    "Would you like me to guide you step by step, or answer your questions?"
 )
 
 STEPS = [
-    "First, download the Rupeek app from the Play Store.",
-    "Next, complete your Aadhaar KYC.",
-    "Then select your loan amount and confirm disbursal."
+    "Step one. Download the Rupeek app from the Play Store.",
+    "Step two. Complete your Aadhaar KYC inside the app.",
+    "Step three. Select your loan amount and confirm disbursal."
 ]
 
 FAQ_MAP = {
     "interest": "It is zero percent interest if you repay by the due date. Otherwise EMI interest applies as shown in the app.",
     "limit": "Your approved loan limit is visible inside the Rupeek app under the Click Cash banner.",
     "emi": "EMI depends on the tenure you select. The app shows the exact EMI before confirmation.",
-    "processing": "Processing fee is shown clearly in the app before confirmation. There are no hidden charges.",
-    "documents": "No documents or income proof are required. It is fully digital.",
+    "processing": "Processing fee is clearly shown in the app before confirmation. There are no hidden charges.",
+    "documents": "No documents or income proof are required. It is a fully digital process.",
     "cibil": "Yes, timely repayment improves your CIBIL score.",
     "banner": "Please update the Rupeek app and reopen it. You will see the Click Cash banner.",
     "mandate": "The small amount paid during mandate setup is for bank verification and gets refunded.",
@@ -65,18 +66,18 @@ FAQ_MAP = {
 }
 
 # ================= HELPERS =================
-def is_valid_sentence(text: str) -> bool:
-    words = [w for w in text.split() if len(w) > 2]
-    return len(words) >= 3
+def is_partial_sentence(text: str) -> bool:
+    t = text.lower().strip()
+    return t.endswith(("what", "what is", "what is the", "how", "why", "when"))
 
 def detect_faq(text: str):
     t = text.lower()
-    for key, answer in FAQ_MAP.items():
+    for key in FAQ_MAP:
         if key in t:
-            return answer
+            return FAQ_MAP[key]
     return None
 
-def pcm_to_wav(pcm):
+def pcm_to_wav(pcm: bytes) -> bytes:
     buf = io.BytesIO()
     buf.write(b"RIFF")
     buf.write(struct.pack("<I", 36 + len(pcm)))
@@ -87,54 +88,54 @@ def pcm_to_wav(pcm):
     buf.write(pcm)
     return buf.getvalue()
 
-def is_speech(pcm):
+def is_speech(pcm: bytes) -> bool:
     energy = sum(
         abs(int.from_bytes(pcm[i:i+2], "little", signed=True))
-        for i in range(0, len(pcm)-1, 2)
+        for i in range(0, len(pcm) - 1, 2)
     )
     return (energy / max(len(pcm)//2, 1)) > SPEECH_THRESHOLD
 
-def stt_safe(pcm):
+def stt_safe(pcm: bytes) -> str:
     try:
         r = requests.post(
             "https://api.sarvam.ai/speech-to-text",
             headers={"api-subscription-key": SARVAM_API_KEY},
             files={"file": ("audio.wav", pcm_to_wav(pcm), "audio/wav")},
             data={"language_code": "en-IN"},
-            timeout=10
+            timeout=10,
         )
         return r.json().get("transcript", "").strip()
     except Exception:
         return ""
 
-def tts(text):
+def tts(text: str) -> bytes:
     r = requests.post(
         "https://api.sarvam.ai/text-to-speech",
         headers={
             "api-subscription-key": SARVAM_API_KEY,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         },
         json={
             "text": text,
             "target_language_code": "en-IN",
-            "speech_sample_rate": "16000"
+            "speech_sample_rate": "16000",
         },
-        timeout=10
+        timeout=10,
     )
     r.raise_for_status()
     return base64.b64decode(r.json()["audios"][0])
 
-async def speak(ws, text, session):
+async def speak(ws: WebSocket, text: str, session: dict):
     log.info(f"BOT → {text}")
     session["bot_speaking"] = True
+
     pcm = await asyncio.to_thread(tts, text)
     for i in range(0, len(pcm), MIN_CHUNK_SIZE):
         await ws.send_text(json.dumps({
             "event": "media",
-            "media": {
-                "payload": base64.b64encode(pcm[i:i+MIN_CHUNK_SIZE]).decode()
-            }
+            "media": {"payload": base64.b64encode(pcm[i:i+MIN_CHUNK_SIZE]).decode()}
         }))
+
     await asyncio.sleep(POST_TTS_DELAY)
     session["bot_speaking"] = False
 
@@ -155,83 +156,94 @@ async def ws_handler(ws: WebSocket):
     silence_chunks = 0
     speech_chunks = 0
 
-    while True:
-        try:
-            msg = await ws.receive()
-        except (WebSocketDisconnect, RuntimeError):
-            log.info("🔌 WebSocket disconnected by Exotel")
-            return
+    try:
+        while True:
+            try:
+                msg = await ws.receive()
+            except RuntimeError:
+                log.info("🔌 WebSocket disconnected by Exotel")
+                break
 
-        if "text" not in msg:
-            continue
+            if "text" not in msg:
+                continue
 
-        data = json.loads(msg["text"])
+            data = json.loads(msg["text"])
 
-        # 🔹 Exotel START event (VERY IMPORTANT)
-        if data.get("event") == "start":
-            log.info("📡 Exotel start event received")
-            if not session["started"]:
-                session["started"] = True
-                await asyncio.sleep(0.3)  # allow Exotel media channel to open
+            if data.get("event") == "start" and not session["started"]:
+                log.info("📡 Exotel start event received")
                 await speak(ws, PITCH, session)
-            continue
+                session["started"] = True
+                continue
 
-        if data.get("event") != "media" or session["bot_speaking"]:
-            continue
+            if data.get("event") != "media" or session["bot_speaking"]:
+                continue
 
-        buf += base64.b64decode(data["media"]["payload"])
+            buf += base64.b64decode(data["media"]["payload"])
 
-        if len(buf) < MIN_CHUNK_SIZE:
-            continue
+            if len(buf) < MIN_CHUNK_SIZE:
+                continue
 
-        frame, buf = buf[:MIN_CHUNK_SIZE], buf[MIN_CHUNK_SIZE:]
+            frame, buf = buf[:MIN_CHUNK_SIZE], buf[MIN_CHUNK_SIZE:]
 
-        if is_speech(frame):
-            speech += frame
-            speech_chunks += 1
-            silence_chunks = 0
-        else:
-            silence_chunks += 1
-
-        if speech_chunks < MIN_SPEECH_CHUNKS and silence_chunks < SILENCE_CHUNKS:
-            continue
-
-        text = await asyncio.to_thread(stt_safe, speech)
-        speech = b""
-        speech_chunks = 0
-        silence_chunks = 0
-
-        if not text or not is_valid_sentence(text):
-            continue
-
-        log.info(f"USER → {text}")
-
-        faq_answer = detect_faq(text)
-        if faq_answer:
-            await speak(ws, faq_answer, session)
-            continue
-
-        if "yes" in text.lower() or "guide" in text.lower():
-            if session["step"] < len(STEPS):
-                await speak(ws, STEPS[session["step"]], session)
-                session["step"] += 1
+            if is_speech(frame):
+                speech += frame
+                speech_chunks += 1
+                silence_chunks = 0
             else:
+                silence_chunks += 1
+
+            if speech_chunks < MIN_SPEECH_CHUNKS and silence_chunks < SILENCE_CHUNKS:
+                continue
+
+            text = await asyncio.to_thread(stt_safe, speech)
+            speech = b""
+            speech_chunks = 0
+            silence_chunks = 0
+
+            if not text:
+                continue
+
+            log.info(f"USER → {text}")
+
+            if is_partial_sentence(text):
                 await speak(
                     ws,
-                    "Great! Whenever you’re ready, just open the Rupeek app and check your pre-approved loan limit.",
-                    session
+                    "Please complete your question, or say guide me to continue step by step.",
+                    session,
                 )
-            continue
+                continue
 
-        if "no" in text.lower():
-            await speak(ws, "No problem. Thank you for your time.", session)
-            return
+            faq = detect_faq(text)
+            if faq:
+                await speak(ws, faq, session)
+                await speak(ws, "You can ask another question or say guide me.", session)
+                continue
 
-        await speak(
-            ws,
-            "I can guide you step by step or answer any questions about the loan.",
-            session
-        )
+            if "yes" in text.lower() or "guide" in text.lower():
+                if session["step"] < len(STEPS):
+                    await speak(ws, STEPS[session["step"]], session)
+                    await speak(ws, "Say next once completed.", session)
+                    session["step"] += 1
+                else:
+                    await speak(
+                        ws,
+                        "Great! Whenever you’re ready, just open the Rupeek app and check your pre-approved loan limit.",
+                        session,
+                    )
+                continue
+
+            if "no" in text.lower():
+                await speak(ws, "No problem. Thank you for your time.", session)
+                break
+
+            await speak(
+                ws,
+                "I can guide you step by step or answer any questions about the loan.",
+                session,
+            )
+
+    except WebSocketDisconnect:
+        log.info("📴 Call disconnected")
 
 # ================= START =================
 if __name__ == "__main__":
