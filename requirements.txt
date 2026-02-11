@@ -6,3 +6,4 @@ websockets
 g711
 pydantic
 python-multipart
+websockets==12.0
