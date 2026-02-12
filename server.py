@@ -1,5 +1,5 @@
 # server.py
-import os, json, asyncio, logging, base64, requests, io, struct, time
+import os, json, asyncio, logging, base64, requests, io, struct
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
@@ -12,12 +12,10 @@ SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 # ================= AUDIO CONFIG =================
 SAMPLE_RATE = 16000
 MIN_CHUNK_SIZE = 3200
-SPEECH_THRESHOLD = 500
-
-SILENCE_CHUNKS = 6          # 🔥 aggressive cutoff
-MIN_SPEECH_CHUNKS = 4
-POST_TTS_DELAY = 0.8        # Exotel-safe pause
-INTENT_COOLDOWN = 1.2       # lock after answer
+SPEECH_THRESHOLD = 520
+SILENCE_CHUNKS = 10
+MIN_SPEECH_CHUNKS = 6
+POST_TTS_DELAY = 0.6
 
 # ================= LOGGING =================
 logging.basicConfig(
@@ -47,16 +45,28 @@ FAQ_MAP = {
     "repayment": "You must repay by the month end due date to enjoy zero percent interest.",
     "limit": "Your approved loan limit is visible inside the Rupeek app under the Click Cash banner.",
     "emi": "EMI depends on the tenure you select. The app shows the exact EMI before confirmation.",
-    "processing": "Processing fee is shown clearly in the app before confirmation. There are no hidden charges.",
-    "document": "No documents or income proof are required. It is fully digital.",
+    "processing": "The processing fee is shown clearly in the app before confirmation. There are no hidden charges.",
     "cibil": "Yes, timely repayment improves your CIBIL score.",
-    "banner": "Please update the Rupeek app and reopen it. You will see the Click Cash banner.",
     "mandate": "The small amount paid during mandate setup is for bank verification and gets refunded.",
-    "risk": "There is no risk if you repay on time. Otherwise the loan converts into EMI.",
-    "money": "Once you complete the steps in the app, money is credited within sixty seconds."
+    "risk": "There is no risk if you repay on time. Otherwise the loan converts into EMI."
 }
 
-# ================= AUDIO HELPERS =================
+# ================= HELPERS =================
+def looks_incomplete(text: str) -> bool:
+    t = text.lower().strip()
+    if len(t.split()) < 3:
+        return True
+    if t.endswith(("what", "what is", "the", "is", "how", "why")):
+        return True
+    return False
+
+def detect_faq(text: str):
+    t = text.lower()
+    for key in FAQ_MAP:
+        if key in t:
+            return FAQ_MAP[key]
+    return None
+
 def pcm_to_wav(pcm):
     buf = io.BytesIO()
     buf.write(b"RIFF")
@@ -69,8 +79,10 @@ def pcm_to_wav(pcm):
     return buf.getvalue()
 
 def is_speech(pcm):
-    energy = sum(abs(int.from_bytes(pcm[i:i+2], "little", signed=True))
-                 for i in range(0, len(pcm)-1, 2))
+    energy = sum(
+        abs(int.from_bytes(pcm[i:i+2], "little", signed=True))
+        for i in range(0, len(pcm)-1, 2)
+    )
     return (energy / max(len(pcm)//2, 1)) > SPEECH_THRESHOLD
 
 def stt_safe(pcm):
@@ -105,22 +117,16 @@ def tts(text):
 async def speak(ws, text, session):
     log.info(f"BOT → {text}")
     session["bot_speaking"] = True
-    session["intent_locked"] = True
-
     pcm = await asyncio.to_thread(tts, text)
+
     for i in range(0, len(pcm), MIN_CHUNK_SIZE):
         await ws.send_text(json.dumps({
             "event": "media",
-            "media": {
-                "payload": base64.b64encode(
-                    pcm[i:i+MIN_CHUNK_SIZE]
-                ).decode()
-            }
+            "media": {"payload": base64.b64encode(pcm[i:i+MIN_CHUNK_SIZE]).decode()}
         }))
 
     await asyncio.sleep(POST_TTS_DELAY)
     session["bot_speaking"] = False
-    session["last_response"] = time.time()
 
 # ================= WS =================
 @app.websocket("/ws")
@@ -131,9 +137,7 @@ async def ws_handler(ws: WebSocket):
     session = {
         "started": False,
         "bot_speaking": False,
-        "intent_locked": False,
-        "step": 0,
-        "last_response": 0
+        "step": 0
     }
 
     buf, speech = b"", b""
@@ -144,7 +148,7 @@ async def ws_handler(ws: WebSocket):
             try:
                 msg = await ws.receive()
             except RuntimeError:
-                log.info("🔌 WebSocket closed by Exotel")
+                log.info("🔌 WebSocket closed safely")
                 break
 
             if "text" not in msg:
@@ -158,16 +162,8 @@ async def ws_handler(ws: WebSocket):
                 session["started"] = True
                 continue
 
-            if data.get("event") != "media":
+            if data.get("event") != "media" or session["bot_speaking"]:
                 continue
-
-            if session["bot_speaking"]:
-                continue
-
-            # cooldown after response
-            if session["intent_locked"] and time.time() - session["last_response"] < INTENT_COOLDOWN:
-                continue
-            session["intent_locked"] = False
 
             buf += base64.b64decode(data["media"]["payload"])
 
@@ -193,39 +189,43 @@ async def ws_handler(ws: WebSocket):
                 continue
 
             log.info(f"USER → {text}")
+
+            if looks_incomplete(text):
+                log.info("⏳ Waiting for complete sentence")
+                continue
+
+            faq = detect_faq(text)
+            if faq:
+                await speak(ws, faq, session)
+                await speak(ws, "You can ask another question or say guide me.", session)
+                continue
+
             t = text.lower()
 
-            # FAQ detection
-            for key, answer in FAQ_MAP.items():
-                if key in t:
-                    await speak(ws, answer, session)
-                    await speak(ws, "You can ask another question or say guide me.", session)
-                    break
-            else:
-                # Guide flow
-                if "guide" in t or "yes" in t:
-                    if session["step"] < len(STEPS):
-                        await speak(ws, STEPS[session["step"]], session)
-                        session["step"] += 1
-                    else:
-                        await speak(
-                            ws,
-                            "Great! Whenever you’re ready, just open the Rupeek app and check your pre approved loan limit.",
-                            session
-                        )
-                elif "no" in t:
-                    await speak(ws, "No problem. Thank you for your time.", session)
-                    break
+            if "guide" in t or "yes" in t:
+                if session["step"] < len(STEPS):
+                    await speak(ws, STEPS[session["step"]], session)
+                    session["step"] += 1
                 else:
                     await speak(
                         ws,
-                        "I can guide you step by step or answer questions about interest, repayment, or loan limit.",
+                        "Great! Whenever you’re ready, just open the Rupeek app and check your pre approved loan limit.",
                         session
                     )
+                continue
+
+            if "no" in t or "not interested" in t:
+                await speak(ws, "No problem. Thank you for your time.", session)
+                break
+
+            await speak(
+                ws,
+                "I can guide you step by step or answer questions about interest, repayment, or loan limit.",
+                session
+            )
 
     except WebSocketDisconnect:
         log.info("📴 Call disconnected")
 
-# ================= START =================
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
