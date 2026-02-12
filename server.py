@@ -1,4 +1,3 @@
-# server.py
 import os, json, asyncio, logging, base64, requests, io, struct
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -18,10 +17,7 @@ MIN_SPEECH_CHUNKS = 6
 POST_TTS_DELAY = 0.6
 
 # ================= LOGGING =================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("voicebot")
 
 app = FastAPI()
@@ -45,25 +41,14 @@ FAQ_MAP = {
     "repayment": "You must repay by the month end due date to enjoy zero percent interest.",
     "limit": "Your approved loan limit is visible inside the Rupeek app under the Click Cash banner.",
     "emi": "The EMI depends on the tenure you select. The app shows the exact EMI before confirmation.",
-    "processing": "The processing fee is clearly shown in the app before confirmation. There are no hidden charges.",
+    "processing": "The processing fee is shown clearly in the app before confirmation. There are no hidden charges.",
     "mandate": "The small amount paid during mandate setup is only for bank verification and gets refunded.",
-    "risk": "There is no risk if you repay on time. Otherwise the loan converts into EMI as shown in the app."
+    "risk": "There is no risk if you repay on time. Otherwise the loan converts into EMI."
 }
 
 FILLERS = ["hello", "hi", "yeah", "yes", "ok", "okay", "haan", "hmm", "right", "sure"]
 
 # ================= HELPERS =================
-def is_meaningful(text: str) -> bool:
-    words = [w for w in text.split() if len(w) > 2]
-    return len(words) >= 2
-
-def detect_faq(text: str):
-    t = text.lower()
-    for key in FAQ_MAP:
-        if key in t:
-            return FAQ_MAP[key]
-    return None
-
 def pcm_to_wav(pcm):
     buf = io.BytesIO()
     buf.write(b"RIFF")
@@ -115,11 +100,15 @@ async def speak(ws, text, session):
     log.info(f"BOT → {text}")
     session["bot_speaking"] = True
     pcm = await asyncio.to_thread(tts, text)
+
     for i in range(0, len(pcm), MIN_CHUNK_SIZE):
         await ws.send_text(json.dumps({
             "event": "media",
-            "media": {"payload": base64.b64encode(pcm[i:i+MIN_CH_SIZE]).decode()}
+            "media": {
+                "payload": base64.b64encode(pcm[i:i+MIN_CHUNK_SIZE]).decode()
+            }
         }))
+
     await asyncio.sleep(POST_TTS_DELAY)
     session["bot_speaking"] = False
 
@@ -129,12 +118,7 @@ async def ws_handler(ws: WebSocket):
     await ws.accept()
     log.info("📞 Call connected")
 
-    session = {
-        "started": False,
-        "bot_speaking": False,
-        "step": 0
-    }
-
+    session = {"started": False, "bot_speaking": False, "step": 0}
     buf, speech = b"", b""
     silence_chunks, speech_chunks = 0, 0
 
@@ -181,52 +165,33 @@ async def ws_handler(ws: WebSocket):
             speech, speech_chunks, silence_chunks = b"", 0, 0
 
             if not text:
-                continue  # silence → do nothing
+                continue
 
             log.info(f"USER → {text}")
             t = text.lower()
 
-            # Handle fillers
             if any(f in t for f in FILLERS):
-                await speak(
-                    ws,
-                    "I can guide you step by step or you can ask about interest, repayment, or loan limit.",
-                    session
-                )
+                await speak(ws, "I can guide you step by step or answer questions about interest, repayment, or loan limit.", session)
                 continue
 
-            # FAQ
-            faq = detect_faq(t)
-            if faq:
-                await speak(ws, faq, session)
-                await speak(ws, "You can ask another question or say guide me.", session)
-                continue
-
-            # Guide flow
-            if "guide" in t or "yes" in t:
-                if session["step"] < len(STEPS):
-                    await speak(ws, STEPS[session["step"]], session)
-                    session["step"] += 1
+            for key, ans in FAQ_MAP.items():
+                if key in t:
+                    await speak(ws, ans, session)
+                    await speak(ws, "You can ask another question or say guide me.", session)
+                    break
+            else:
+                if "guide" in t:
+                    if session["step"] < len(STEPS):
+                        await speak(ws, STEPS[session["step"]], session)
+                        session["step"] += 1
+                elif "no" in t:
+                    await speak(ws, "No problem. Thank you for your time.", session)
+                    break
                 else:
-                    await speak(
-                        ws,
-                        "Great! Whenever you’re ready, just open the Rupeek app and check your pre approved loan limit.",
-                        session
-                    )
-                continue
-
-            # Negative
-            if "no" in t or "not interested" in t:
-                await speak(ws, "No problem. Thank you for your time.", session)
-                break
-
-            # Unclear but spoken sentence
-            if is_meaningful(t):
-                await speak(ws, "Sorry, I didn’t catch that. Could you please repeat?", session)
+                    await speak(ws, "Sorry, I didn’t catch that. Could you please repeat?", session)
 
     except WebSocketDisconnect:
         log.info("📴 Call disconnected")
 
-# ================= START =================
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
