@@ -21,7 +21,7 @@ app = FastAPI()
 
 # ================= WHISPER =================
 log.info("🔊 Loading Whisper model...")
-whisper_model = whisper.load_model("base")  # best balance for calls
+whisper_model = whisper.load_model("tiny")
 log.info("✅ Whisper model loaded")
 
 # ================= AUDIO CONFIG =================
