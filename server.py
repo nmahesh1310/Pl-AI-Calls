@@ -1,5 +1,5 @@
 # server.py
-import os, json, asyncio, logging, base64, requests, io, struct
+import os, json, asyncio, logging, sys, base64, requests, io, struct
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
@@ -20,7 +20,8 @@ POST_TTS_DELAY = 0.6
 # ================= LOGGING =================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(message)s"
+    format="%(asctime)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("voicebot")
 
@@ -46,19 +47,16 @@ FAQ_MAP = {
     "limit": "Your approved loan limit is visible inside the Rupeek app under the Click Cash banner.",
     "emi": "EMI depends on the tenure you select. The app shows the exact EMI before confirmation.",
     "processing": "The processing fee is shown clearly in the app before confirmation. There are no hidden charges.",
-    "cibil": "Yes, timely repayment improves your CIBIL score.",
-    "mandate": "The small amount paid during mandate setup is for bank verification and gets refunded.",
-    "risk": "There is no risk if you repay on time. Otherwise the loan converts into EMI."
+    "document": "No documents or income proof are required. The process is fully digital.",
+    "mandate": "The small amount paid during mandate setup is for bank verification and is refunded.",
+    "risk": "There is no risk if you repay on time. Otherwise the loan converts into EMI.",
+    "banner": "Please update the Rupeek app and reopen it. You will see the Click Cash banner.",
 }
 
 # ================= HELPERS =================
-def looks_incomplete(text: str) -> bool:
-    t = text.lower().strip()
-    if len(t.split()) < 3:
-        return True
-    if t.endswith(("what", "what is", "the", "is", "how", "why")):
-        return True
-    return False
+def is_valid_sentence(text: str) -> bool:
+    words = [w for w in text.split() if len(w) > 2]
+    return len(words) >= 3
 
 def detect_faq(text: str):
     t = text.lower()
@@ -72,7 +70,7 @@ def pcm_to_wav(pcm):
     buf.write(b"RIFF")
     buf.write(struct.pack("<I", 36 + len(pcm)))
     buf.write(b"WAVEfmt ")
-    buf.write(struct.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE, SAMPLE_RATE*2, 2, 16))
+    buf.write(struct.pack("<IHHIIHH", 16, 1, 1, SAMPLE_RATE, SAMPLE_RATE * 2, 2, 16))
     buf.write(b"data")
     buf.write(struct.pack("<I", len(pcm)))
     buf.write(pcm)
@@ -95,7 +93,7 @@ def stt_safe(pcm):
             timeout=10
         )
         return r.json().get("transcript", "").strip()
-    except:
+    except Exception:
         return ""
 
 def tts(text):
@@ -128,7 +126,7 @@ async def speak(ws, text, session):
     await asyncio.sleep(POST_TTS_DELAY)
     session["bot_speaking"] = False
 
-# ================= WS =================
+# ================= WEBSOCKET =================
 @app.websocket("/ws")
 async def ws_handler(ws: WebSocket):
     await ws.accept()
@@ -137,7 +135,8 @@ async def ws_handler(ws: WebSocket):
     session = {
         "started": False,
         "bot_speaking": False,
-        "step": 0
+        "step": 0,
+        "confusion_count": 0
     }
 
     buf, speech = b"", b""
@@ -185,14 +184,23 @@ async def ws_handler(ws: WebSocket):
             text = await asyncio.to_thread(stt_safe, speech)
             speech, speech_chunks, silence_chunks = b"", 0, 0
 
-            if not text:
+            # ---------------- UNCLEAR HANDLING ----------------
+            if not text or not is_valid_sentence(text):
+                session["confusion_count"] += 1
+
+                if session["confusion_count"] == 2:
+                    await speak(ws, "Sorry, I didn’t catch that. Could you please repeat?", session)
+                elif session["confusion_count"] == 3:
+                    await speak(ws, "You can ask about interest, repayment, loan limit, or say guide me.", session)
+                elif session["confusion_count"] >= 5:
+                    await speak(ws, "No problem. Thank you for your time.", session)
+                    break
+
                 continue
 
+            # ---------------- VALID INPUT ----------------
+            session["confusion_count"] = 0
             log.info(f"USER → {text}")
-
-            if looks_incomplete(text):
-                log.info("⏳ Waiting for complete sentence")
-                continue
 
             faq = detect_faq(text)
             if faq:
@@ -200,9 +208,7 @@ async def ws_handler(ws: WebSocket):
                 await speak(ws, "You can ask another question or say guide me.", session)
                 continue
 
-            t = text.lower()
-
-            if "guide" in t or "yes" in t:
+            if "guide" in text.lower() or "yes" in text.lower():
                 if session["step"] < len(STEPS):
                     await speak(ws, STEPS[session["step"]], session)
                     session["step"] += 1
@@ -214,7 +220,7 @@ async def ws_handler(ws: WebSocket):
                     )
                 continue
 
-            if "no" in t or "not interested" in t:
+            if "no" in text.lower():
                 await speak(ws, "No problem. Thank you for your time.", session)
                 break
 
@@ -227,5 +233,6 @@ async def ws_handler(ws: WebSocket):
     except WebSocketDisconnect:
         log.info("📴 Call disconnected")
 
+# ================= START =================
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
