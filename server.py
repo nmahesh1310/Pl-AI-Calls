@@ -1,26 +1,35 @@
-import os, json, asyncio, logging, base64, requests, io, struct
+# server.py
+import os, json, asyncio, logging, base64, io, struct, time
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
+import whisper
 
 # ================= ENV =================
 load_dotenv()
 PORT = int(os.getenv("PORT", 10000))
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+
+# ================= LOGGING =================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("voicebot")
+
+# ================= APP =================
+app = FastAPI()
+
+# ================= WHISPER =================
+log.info("🔊 Loading Whisper model...")
+whisper_model = whisper.load_model("base")  # best balance for calls
+log.info("✅ Whisper model loaded")
 
 # ================= AUDIO CONFIG =================
 SAMPLE_RATE = 16000
 MIN_CHUNK_SIZE = 3200
-SPEECH_THRESHOLD = 520
-SILENCE_CHUNKS = 10
-MIN_SPEECH_CHUNKS = 6
-POST_TTS_DELAY = 0.6
-
-# ================= LOGGING =================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger("voicebot")
-
-app = FastAPI()
+SILENCE_CHUNKS = 8
+MIN_SPEECH_CHUNKS = 4
+POST_TTS_DELAY = 0.5
 
 # ================= SCRIPT =================
 PITCH = (
@@ -32,21 +41,17 @@ PITCH = (
 
 STEPS = [
     "First, download the Rupeek app from the Play Store.",
-    "Next, complete your Aadhaar KYC.",
+    "Next, complete your Aadhaar KYC inside the app.",
     "Then select your loan amount and confirm disbursal."
 ]
 
 FAQ_MAP = {
-    "interest": "It is zero percent interest if you repay by the due date. Otherwise EMI interest applies as shown in the app.",
-    "repayment": "You must repay by the month end due date to enjoy zero percent interest.",
+    "interest": "It is zero percent interest if you repay by the due date. Otherwise EMI interest applies.",
     "limit": "Your approved loan limit is visible inside the Rupeek app under the Click Cash banner.",
-    "emi": "The EMI depends on the tenure you select. The app shows the exact EMI before confirmation.",
-    "processing": "The processing fee is shown clearly in the app before confirmation. There are no hidden charges.",
-    "mandate": "The small amount paid during mandate setup is only for bank verification and gets refunded.",
-    "risk": "There is no risk if you repay on time. Otherwise the loan converts into EMI."
+    "emi": "EMI depends on the tenure you select. The exact EMI is shown in the app.",
+    "repayment": "You must repay by the month end due date to enjoy zero percent interest.",
+    "mandate": "The small mandate amount is only for bank verification and will not be deducted."
 }
-
-FILLERS = ["hello", "hi", "yeah", "yes", "ok", "okay", "haan", "hmm", "right", "sure"]
 
 # ================= HELPERS =================
 def pcm_to_wav(pcm):
@@ -60,65 +65,53 @@ def pcm_to_wav(pcm):
     buf.write(pcm)
     return buf.getvalue()
 
-def is_speech(pcm):
-    energy = sum(
-        abs(int.from_bytes(pcm[i:i+2], "little", signed=True))
-        for i in range(0, len(pcm)-1, 2)
-    )
-    return (energy / max(len(pcm)//2, 1)) > SPEECH_THRESHOLD
-
-def stt_safe(pcm):
+def whisper_stt(pcm):
     try:
-        r = requests.post(
-            "https://api.sarvam.ai/speech-to-text",
-            headers={"api-subscription-key": SARVAM_API_KEY},
-            files={"file": ("audio.wav", pcm_to_wav(pcm), "audio/wav")},
-            data={"language_code": "en-IN"},
-            timeout=10
+        wav = pcm_to_wav(pcm)
+        result = whisper_model.transcribe(
+            wav,
+            language="en",
+            fp16=False,
+            condition_on_previous_text=False
         )
-        return r.json().get("transcript", "").strip()
-    except:
+        return result["text"].strip().lower()
+    except Exception as e:
+        log.error(f"STT error: {e}")
         return ""
-
-def tts(text):
-    r = requests.post(
-        "https://api.sarvam.ai/text-to-speech",
-        headers={
-            "api-subscription-key": SARVAM_API_KEY,
-            "Content-Type": "application/json"
-        },
-        json={
-            "text": text,
-            "target_language_code": "en-IN",
-            "speech_sample_rate": "16000"
-        },
-        timeout=10
-    )
-    return base64.b64decode(r.json()["audios"][0])
 
 async def speak(ws, text, session):
     log.info(f"BOT → {text}")
     session["bot_speaking"] = True
-    pcm = await asyncio.to_thread(tts, text)
 
-    for i in range(0, len(pcm), MIN_CHUNK_SIZE):
-        await ws.send_text(json.dumps({
-            "event": "media",
-            "media": {
-                "payload": base64.b64encode(pcm[i:i+MIN_CHUNK_SIZE]).decode()
-            }
-        }))
+    # Silence packet keeps Exotel alive
+    silence = base64.b64encode(b"\x00" * MIN_CHUNK_SIZE).decode()
+    await ws.send_text(json.dumps({
+        "event": "media",
+        "media": {"payload": silence}
+    }))
+
+    # Text-only mode (Exotel plays TTS)
+    await ws.send_text(json.dumps({
+        "event": "say",
+        "text": text
+    }))
 
     await asyncio.sleep(POST_TTS_DELAY)
     session["bot_speaking"] = False
 
-# ================= WEBSOCKET =================
+# ================= WS =================
 @app.websocket("/ws")
 async def ws_handler(ws: WebSocket):
     await ws.accept()
     log.info("📞 Call connected")
 
-    session = {"started": False, "bot_speaking": False, "step": 0}
+    session = {
+        "started": False,
+        "bot_speaking": False,
+        "step": 0,
+        "failures": 0
+    }
+
     buf, speech = b"", b""
     silence_chunks, speech_chunks = 0, 0
 
@@ -144,54 +137,55 @@ async def ws_handler(ws: WebSocket):
             if data.get("event") != "media" or session["bot_speaking"]:
                 continue
 
-            buf += base64.b64decode(data["media"]["payload"])
+            chunk = base64.b64decode(data["media"]["payload"])
+            buf += chunk
 
             if len(buf) < MIN_CHUNK_SIZE:
                 continue
 
             frame, buf = buf[:MIN_CHUNK_SIZE], buf[MIN_CHUNK_SIZE:]
-
-            if is_speech(frame):
-                speech += frame
-                speech_chunks += 1
-                silence_chunks = 0
-            else:
-                silence_chunks += 1
+            speech += frame
+            speech_chunks += 1
+            silence_chunks += 1
 
             if speech_chunks < MIN_SPEECH_CHUNKS and silence_chunks < SILENCE_CHUNKS:
                 continue
 
-            text = await asyncio.to_thread(stt_safe, speech)
+            text = whisper_stt(speech)
             speech, speech_chunks, silence_chunks = b"", 0, 0
 
             if not text:
+                session["failures"] += 1
+                if session["failures"] >= 2:
+                    await speak(ws, "Sorry, I didn’t catch that. Please repeat slowly.", session)
+                    session["failures"] = 0
                 continue
 
             log.info(f"USER → {text}")
-            t = text.lower()
+            session["failures"] = 0
 
-            if any(f in t for f in FILLERS):
-                await speak(ws, "I can guide you step by step or answer questions about interest, repayment, or loan limit.", session)
-                continue
-
-            for key, ans in FAQ_MAP.items():
-                if key in t:
-                    await speak(ws, ans, session)
+            # FAQ
+            for key, answer in FAQ_MAP.items():
+                if key in text:
+                    await speak(ws, answer, session)
                     await speak(ws, "You can ask another question or say guide me.", session)
                     break
             else:
-                if "guide" in t:
+                if "guide" in text or "yes" in text:
                     if session["step"] < len(STEPS):
                         await speak(ws, STEPS[session["step"]], session)
                         session["step"] += 1
-                elif "no" in t:
+                    else:
+                        await speak(ws, "Great! Whenever you’re ready, just open the Rupeek app and check your pre approved loan limit.", session)
+                elif "no" in text:
                     await speak(ws, "No problem. Thank you for your time.", session)
                     break
                 else:
-                    await speak(ws, "Sorry, I didn’t catch that. Could you please repeat?", session)
+                    await speak(ws, "Please say interest, repayment, loan limit, or guide me.", session)
 
     except WebSocketDisconnect:
         log.info("📴 Call disconnected")
 
+# ================= START =================
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
