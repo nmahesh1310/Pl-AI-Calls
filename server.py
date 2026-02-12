@@ -1,35 +1,46 @@
-# server.py
-import os, json, asyncio, logging, base64, io, struct, time
+import os
+import json
+import asyncio
+import logging
+import base64
+import io
+import struct
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
-import whisper
+import requests
+
+from faster_whisper import WhisperModel
 
 # ================= ENV =================
 load_dotenv()
 PORT = int(os.getenv("PORT", 10000))
+SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+
+# ================= CONFIG =================
+SAMPLE_RATE = 16000
+CHUNK_SIZE = 3200
+SPEECH_THRESHOLD = 520
+MIN_SPEECH_CHUNKS = 6
+MAX_SILENCE_CHUNKS = 10
+POST_TTS_DELAY = 0.6
+MAX_REPEAT_PROMPTS = 2
 
 # ================= LOGGING =================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-log = logging.getLogger("voicebot")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+log = logging.getLogger("ai-caller")
 
 # ================= APP =================
 app = FastAPI()
 
-# ================= WHISPER =================
-log.info("🔊 Loading Whisper model...")
-whisper_model = whisper.load_model("tiny")
-log.info("✅ Whisper model loaded")
-
-# ================= AUDIO CONFIG =================
-SAMPLE_RATE = 16000
-MIN_CHUNK_SIZE = 3200
-SILENCE_CHUNKS = 8
-MIN_SPEECH_CHUNKS = 4
-POST_TTS_DELAY = 0.5
+# ================= LOAD WHISPER =================
+log.info("🔊 Loading Faster-Whisper model (tiny, CPU, int8)...")
+whisper_model = WhisperModel(
+    "tiny",
+    device="cpu",
+    compute_type="int8"
+)
+log.info("✅ Faster-Whisper loaded successfully")
 
 # ================= SCRIPT =================
 PITCH = (
@@ -48,13 +59,14 @@ STEPS = [
 FAQ_MAP = {
     "interest": "It is zero percent interest if you repay by the due date. Otherwise EMI interest applies.",
     "limit": "Your approved loan limit is visible inside the Rupeek app under the Click Cash banner.",
-    "emi": "EMI depends on the tenure you select. The exact EMI is shown in the app.",
+    "emi": "EMI depends on the tenure you choose. The app shows it clearly before confirmation.",
     "repayment": "You must repay by the month end due date to enjoy zero percent interest.",
-    "mandate": "The small mandate amount is only for bank verification and will not be deducted."
+    "processing": "Processing fees are shown clearly in the app. There are no hidden charges.",
+    "documents": "No income documents are required. The process is fully digital."
 }
 
 # ================= HELPERS =================
-def pcm_to_wav(pcm):
+def pcm_to_wav(pcm: bytes) -> bytes:
     buf = io.BytesIO()
     buf.write(b"RIFF")
     buf.write(struct.pack("<I", 36 + len(pcm)))
@@ -65,41 +77,66 @@ def pcm_to_wav(pcm):
     buf.write(pcm)
     return buf.getvalue()
 
-def whisper_stt(pcm):
+def is_speech(pcm: bytes) -> bool:
+    energy = sum(
+        abs(int.from_bytes(pcm[i:i + 2], "little", signed=True))
+        for i in range(0, len(pcm) - 1, 2)
+    )
+    return (energy / max(len(pcm) // 2, 1)) > SPEECH_THRESHOLD
+
+def stt_safe(pcm: bytes) -> str:
     try:
         wav = pcm_to_wav(pcm)
-        result = whisper_model.transcribe(
+        segments, _ = whisper_model.transcribe(
             wav,
             language="en",
-            fp16=False,
-            condition_on_previous_text=False
+            vad_filter=True,
+            beam_size=1
         )
-        return result["text"].strip().lower()
+        text = " ".join(seg.text.strip() for seg in segments).strip()
+        return text
     except Exception as e:
         log.error(f"STT error: {e}")
         return ""
 
-async def speak(ws, text, session):
+def detect_faq(text: str):
+    t = text.lower()
+    for k in FAQ_MAP:
+        if k in t:
+            return FAQ_MAP[k]
+    return None
+
+def tts(text: str) -> bytes:
+    r = requests.post(
+        "https://api.sarvam.ai/text-to-speech",
+        headers={
+            "api-subscription-key": SARVAM_API_KEY,
+            "Content-Type": "application/json"
+        },
+        json={
+            "text": text,
+            "target_language_code": "en-IN",
+            "speech_sample_rate": "16000"
+        },
+        timeout=10
+    )
+    return base64.b64decode(r.json()["audios"][0])
+
+async def speak(ws: WebSocket, text: str, session: dict):
     log.info(f"BOT → {text}")
     session["bot_speaking"] = True
+    pcm = await asyncio.to_thread(tts, text)
 
-    # Silence packet keeps Exotel alive
-    silence = base64.b64encode(b"\x00" * MIN_CHUNK_SIZE).decode()
-    await ws.send_text(json.dumps({
-        "event": "media",
-        "media": {"payload": silence}
-    }))
-
-    # Text-only mode (Exotel plays TTS)
-    await ws.send_text(json.dumps({
-        "event": "say",
-        "text": text
-    }))
+    for i in range(0, len(pcm), CHUNK_SIZE):
+        await ws.send_text(json.dumps({
+            "event": "media",
+            "media": {"payload": base64.b64encode(pcm[i:i + CHUNK_SIZE]).decode()}
+        }))
 
     await asyncio.sleep(POST_TTS_DELAY)
     session["bot_speaking"] = False
 
-# ================= WS =================
+# ================= WEBSOCKET =================
 @app.websocket("/ws")
 async def ws_handler(ws: WebSocket):
     await ws.accept()
@@ -109,24 +146,18 @@ async def ws_handler(ws: WebSocket):
         "started": False,
         "bot_speaking": False,
         "step": 0,
-        "failures": 0
+        "repeat_count": 0
     }
 
-    buf, speech = b"", b""
-    silence_chunks, speech_chunks = 0, 0
+    buf = b""
+    speech = b""
+    speech_chunks = 0
+    silence_chunks = 0
 
     try:
         while True:
-            try:
-                msg = await ws.receive()
-            except RuntimeError:
-                log.info("🔌 WebSocket closed safely")
-                break
-
-            if "text" not in msg:
-                continue
-
-            data = json.loads(msg["text"])
+            msg = await ws.receive_text()
+            data = json.loads(msg)
 
             if data.get("event") == "start" and not session["started"]:
                 log.info("📡 Exotel start event received")
@@ -137,55 +168,71 @@ async def ws_handler(ws: WebSocket):
             if data.get("event") != "media" or session["bot_speaking"]:
                 continue
 
-            chunk = base64.b64decode(data["media"]["payload"])
-            buf += chunk
+            buf += base64.b64decode(data["media"]["payload"])
 
-            if len(buf) < MIN_CHUNK_SIZE:
-                continue
+            while len(buf) >= CHUNK_SIZE:
+                frame, buf = buf[:CHUNK_SIZE], buf[CHUNK_SIZE:]
 
-            frame, buf = buf[:MIN_CHUNK_SIZE], buf[MIN_CHUNK_SIZE:]
-            speech += frame
-            speech_chunks += 1
-            silence_chunks += 1
+                if is_speech(frame):
+                    speech += frame
+                    speech_chunks += 1
+                    silence_chunks = 0
+                else:
+                    silence_chunks += 1
 
-            if speech_chunks < MIN_SPEECH_CHUNKS and silence_chunks < SILENCE_CHUNKS:
-                continue
+                if speech_chunks < MIN_SPEECH_CHUNKS:
+                    continue
 
-            text = whisper_stt(speech)
-            speech, speech_chunks, silence_chunks = b"", 0, 0
+                if silence_chunks < MAX_SILENCE_CHUNKS:
+                    continue
 
-            if not text:
-                session["failures"] += 1
-                if session["failures"] >= 2:
-                    await speak(ws, "Sorry, I didn’t catch that. Please repeat slowly.", session)
-                    session["failures"] = 0
-                continue
+                text = await asyncio.to_thread(stt_safe, speech)
+                speech = b""
+                speech_chunks = 0
+                silence_chunks = 0
 
-            log.info(f"USER → {text}")
-            session["failures"] = 0
+                if not text:
+                    session["repeat_count"] += 1
+                    if session["repeat_count"] <= MAX_REPEAT_PROMPTS:
+                        await speak(ws, "Sorry, I didn’t catch that. Could you please repeat?", session)
+                    continue
 
-            # FAQ
-            for key, answer in FAQ_MAP.items():
-                if key in text:
-                    await speak(ws, answer, session)
+                session["repeat_count"] = 0
+                log.info(f"USER → {text}")
+
+                faq = detect_faq(text)
+                if faq:
+                    await speak(ws, faq, session)
                     await speak(ws, "You can ask another question or say guide me.", session)
-                    break
-            else:
-                if "guide" in text or "yes" in text:
+                    continue
+
+                t = text.lower()
+
+                if "guide" in t or "yes" in t:
                     if session["step"] < len(STEPS):
                         await speak(ws, STEPS[session["step"]], session)
                         session["step"] += 1
                     else:
-                        await speak(ws, "Great! Whenever you’re ready, just open the Rupeek app and check your pre approved loan limit.", session)
-                elif "no" in text:
+                        await speak(
+                            ws,
+                            "Great! Whenever you’re ready, just open the Rupeek app and check your pre approved loan limit.",
+                            session
+                        )
+                    continue
+
+                if "no" in t:
                     await speak(ws, "No problem. Thank you for your time.", session)
-                    break
-                else:
-                    await speak(ws, "Please say interest, repayment, loan limit, or guide me.", session)
+                    return
+
+                await speak(
+                    ws,
+                    "I can guide you step by step or answer questions about interest, repayment, or loan limit.",
+                    session
+                )
 
     except WebSocketDisconnect:
-        log.info("📴 Call disconnected")
+        log.info("🔌 WebSocket disconnected safely")
 
-# ================= START =================
+# ================= MAIN =================
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
